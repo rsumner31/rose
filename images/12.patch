@@ -1,0 +1,269 @@
+From 91a1a542b95186511416c77fb92a16b5ce159ab6 Mon Sep 17 00:00:00 2001
+From: kpcyrd <git@rxv.cc>
+Date: Fri, 16 Mar 2018 14:46:53 +0100
+Subject: [PATCH 1/3] typo
+
+---
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 4c59ac0..26ddb13 100644
+--- a/README.md
++++ b/README.md
+@@ -45,7 +45,7 @@ http_basic_auth("https://httpbin.org/basic-auth/foo/buzz", user, password)
+ Connect to a mysql database and try to authenticate with the provided
+ credentials. Returns `true` on success.
+ ```lua
+-mysql_connect("127.0.0.1", 3306", user, password)
++mysql_connect("127.0.0.1", 3306, user, password)
+ ```
+ 
+ ### sleep
+
+From a081fad17cc2f2d5fc9e79fc430671debf5f632c Mon Sep 17 00:00:00 2001
+From: kpcyrd <git@rxv.cc>
+Date: Sat, 17 Mar 2018 03:00:22 +0100
+Subject: [PATCH 2/3] Implement rate limit for performance
+
+---
+ Cargo.lock  |  1 +
+ Cargo.toml  |  1 +
+ src/main.rs | 30 ++++----------------
+ src/pb.rs   | 94 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 102 insertions(+), 24 deletions(-)
+ create mode 100644 src/pb.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8c4d73a..023f49c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -79,6 +79,7 @@ dependencies = [
+  "reqwest 0.8.5 (registry+https://github.com/rust-lang/crates.io-index)",
+  "structopt 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+  "threadpool 1.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
++ "time 0.1.39 (registry+https://github.com/rust-lang/crates.io-index)",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 30938df..8c20421 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,7 @@ colored = "1.6"
+ humantime = "1.1"
+ structopt = "0.2"
+ error-chain = "0.11"
++time = "0.1.35"
+ 
+ reqwest = "0.8"
+ mysql = "12.2.0"
+diff --git a/src/main.rs b/src/main.rs
+index dd08d94..811b9c1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,7 @@ extern crate hlua;
+ extern crate pbr;
+ extern crate threadpool;
+ extern crate colored;
++extern crate time;
+ extern crate humantime;
+ #[macro_use] extern crate error_chain;
+ #[macro_use] extern crate structopt;
+@@ -12,16 +13,16 @@ extern crate mysql;
+ 
+ mod args;
+ mod ctx;
++mod pb;
+ mod runtime;
+ 
+-use pbr::ProgressBar;
++use pb::ProgressBar;
+ use error_chain::ChainedError;
+ use threadpool::ThreadPool;
+ use colored::*;
+ use std::sync::mpsc;
+ use std::fs::{File};
+ use std::sync::Arc;
+-// use std::time::Duration;
+ use std::time::Instant;
+ use std::io;
+ use std::io::BufReader;
+@@ -57,20 +58,6 @@ fn load_scripts(paths: Vec<String>) -> Result<Vec<Arc<ctx::Script>>> {
+         .collect()
+ }
+ 
+-// this macro was vendored until https://github.com/a8m/pb/pull/62 is fixed
+-macro_rules! printfl {
+-   ($w:expr, $($tt:tt)*) => {{
+-        $w.write(&format!($($tt)*).as_bytes()).ok().expect("write() fail");
+-        $w.flush().ok().expect("flush() fail");
+-    }}
+-}
+-
+-// replace this with pb.writeln after https://github.com/a8m/pb/pull/62
+-fn pb_writeln<W: Write>(pb: &mut ProgressBar<W>, s: &str) {
+-    printfl!(io::stderr(), "\r\x1B[2K{}\n", s);
+-    pb.tick();
+-}
+-
+ #[inline]
+ fn infof(prefix: &str, msg: String) -> String {
+     format!("{} {}", prefix.bold(), msg.dimmed())
+@@ -116,11 +103,6 @@ fn run() -> Result<()> {
+     }
+ 
+     let mut pb = ProgressBar::new(attempts as u64);
+-    // we can't set this yet because we call .tick() in pb_writeln
+-    // pb_writeln usually would call .draw to bypass this, but this function is private
+-    // blocked by https://github.com/a8m/pb/pull/62
+-    // pb.set_max_refresh_rate(Some(Duration::from_millis(250)));
+-    pb.format("[#> ]");
+     pb.tick();
+ 
+     let mut valid = 0;
+@@ -128,18 +110,18 @@ fn run() -> Result<()> {
+         match result {
+             Ok(valid) if !valid => (),
+             Ok(_) => {
+-                pb_writeln(&mut pb, &format!("{} {}({}) => {:?}:{:?}", "[+]".bold(), "valid".green(), script.descr().yellow(), user, password));
++                pb.writeln(format!("{} {}({}) => {:?}:{:?}", "[+]".bold(), "valid".green(), script.descr().yellow(), user, password));
+                 valid += 1;
+             },
+             Err(err) => {
+-                pb_writeln(&mut pb, &format!("{} {}({}): {:?}", "[!]".bold(), "error".red(), script.descr().yellow(), err));
++                pb.writeln(format!("{} {}({}): {:?}", "[!]".bold(), "error".red(), script.descr().yellow(), err));
+             }
+         };
+         pb.inc();
+     }
+ 
+     let elapsed = start.elapsed();
+-    print!("\r\x1B[2K{}", infof("[+]",
++    pb.finish_replace(infof("[+]",
+         format!("found {} valid credentials with {} attempts after {}\n",
+             valid, attempts,
+             humantime::format_duration(elapsed))));
+diff --git a/src/pb.rs b/src/pb.rs
+new file mode 100644
+index 0000000..a183679
+--- /dev/null
++++ b/src/pb.rs
+@@ -0,0 +1,94 @@
++// this file contains a wrapper around pbr to work around three things:
++//
++// - there is no function to write above the progress bar
++// - .draw() isn't exposed so we can't bypass the ratelimit in tick.
++//   This means we can't reliably redraw the graph after we wrote above it.
++//   We have to implement rate limiting in our wrapper to ensure we are
++//   able to bypass it when needed.
++// - using colored strings breaks pbr
++//
++// https://github.com/a8m/pb/pull/62
++
++use pbr;
++use std::fmt::Display;
++use std::io::prelude::*;
++use std::io::{self, Stdout};
++use time::{self, SteadyTime, Duration};
++
++
++macro_rules! printfl {
++   ($w:expr, $($tt:tt)*) => {{
++        $w.write(&format!($($tt)*).as_bytes()).ok().expect("write() fail");
++        $w.flush().ok().expect("flush() fail");
++    }}
++}
++
++pub struct ProgressBar {
++    pb: pbr::ProgressBar<Stdout>,
++    current: u64,
++    last_refresh_time: SteadyTime,
++    max_refresh_rate: Option<time::Duration>,
++}
++
++impl ProgressBar {
++    #[inline]
++    pub fn new(total: u64) -> ProgressBar {
++        let mut pb = pbr::ProgressBar::new(total);
++        pb.format("[#> ]");
++
++        let now = SteadyTime::now();
++        let refresh_rate = Duration::milliseconds(250);
++
++        ProgressBar {
++            pb,
++            current: 0,
++            last_refresh_time: now - refresh_rate,
++            max_refresh_rate: Some(refresh_rate),
++        }
++    }
++
++    #[inline]
++    pub fn draw(&mut self) {
++        self.pb.tick()
++    }
++
++    #[inline]
++    pub fn writeln<T: Display>(&mut self, s: T) {
++        printfl!(io::stderr(), "\r\x1B[2K{}\n", s);
++        self.draw()
++    }
++
++    #[inline]
++    pub fn tick(&mut self) {
++        let now = SteadyTime::now();
++        if let Some(mrr) = self.max_refresh_rate {
++            if now - self.last_refresh_time < mrr {
++                return;
++            }
++        }
++
++        self.draw();
++
++        self.last_refresh_time = SteadyTime::now();
++    }
++
++    #[inline]
++    pub fn inc(&mut self) {
++        let now = SteadyTime::now();
++        if let Some(mrr) = self.max_refresh_rate {
++            if now - self.last_refresh_time < mrr {
++                self.current += 1;
++                return;
++            }
++        }
++
++        self.pb.set(self.current);
++
++        self.last_refresh_time = SteadyTime::now();
++    }
++
++    #[inline]
++    pub fn finish_replace<T: Display>(&self, s: T) {
++        print!("\r\x1B[2K{}", s);
++    }
++}
+
+From ddf6b0f96a0404d47727d53897e3df82475443b3 Mon Sep 17 00:00:00 2001
+From: kpcyrd <git@rxv.cc>
+Date: Sat, 17 Mar 2018 03:13:39 +0100
+Subject: [PATCH 3/3] Restyle progress bar
+
+---
+ src/pb.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/pb.rs b/src/pb.rs
+index a183679..310197e 100644
+--- a/src/pb.rs
++++ b/src/pb.rs
+@@ -34,7 +34,7 @@ impl ProgressBar {
+     #[inline]
+     pub fn new(total: u64) -> ProgressBar {
+         let mut pb = pbr::ProgressBar::new(total);
+-        pb.format("[#> ]");
++        pb.format("(=> )");
+ 
+         let now = SteadyTime::now();
+         let refresh_rate = Duration::milliseconds(250);
